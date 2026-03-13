@@ -88,6 +88,8 @@ public class BPMNGLSPValidator implements ModelValidator {
         }
         List<Marker> markers = doValidate(elements, reason);
         afterValidate(elements, reason);
+        logger.fine("validate - found " + markers.size() + "  markers in "
+                + (System.currentTimeMillis() - l) + "ms");
         return markers;
     }
 
@@ -132,11 +134,13 @@ public class BPMNGLSPValidator implements ModelValidator {
      * @return
      */
     private List<Marker> doValidate(final List<GModelElement> elements, final String reason) {
+        // long l = System.currentTimeMillis();
         List<Marker> markers = new ArrayList<>();
 
         for (GModelElement element : elements) {
             if (MarkersReason.LIVE.equals(reason)) {
                 markers.addAll(doLiveValidation(element));
+
             } else if (MarkersReason.BATCH.equals(reason)) {
                 markers.addAll(doBatchValidation(element));
             } else {
@@ -146,6 +150,7 @@ public class BPMNGLSPValidator implements ModelValidator {
                 markers.addAll(doValidate(element.getChildren(), reason));
             }
         }
+
         return markers;
     }
 
@@ -170,24 +175,34 @@ public class BPMNGLSPValidator implements ModelValidator {
                 }
             }
         }
-        // Convert BPMN Markers into GLSP Markers
+        // return GLSP Markers
+        return convertBPMNValidationMarkers(bpmnExtensionMarkers);
+    }
+
+    /**
+     * This method converts a List of BPMNValidationMaker into a GLSP Marker objects
+     * 
+     * @param bpmnExtensionMarkers
+     * @return
+     */
+    public List<Marker> convertBPMNValidationMarkers(List<BPMNValidationMarker> bpmnExtensionMarkers) {
         List<Marker> result = new ArrayList<>();
         for (BPMNValidationMarker bpmnMarker : bpmnExtensionMarkers) {
-            if (bpmnMarker.getElementId().equals(element.getId())) {
-                if (bpmnMarker.getErrorType() == ErrorType.ERROR) {
-                    result.add(new Marker(bpmnMarker.getLabel(), bpmnMarker.getDescription(),
-                            bpmnMarker.getElementId(),
-                            MarkerKind.ERROR));
-                } else if (bpmnMarker.getErrorType() == ErrorType.WARNING) {
-                    result.add(new Marker(bpmnMarker.getLabel(), bpmnMarker.getDescription(),
-                            bpmnMarker.getElementId(),
-                            MarkerKind.WARNING));
-                } else {
-                    result.add(new Marker(bpmnMarker.getLabel(), bpmnMarker.getDescription(),
-                            bpmnMarker.getElementId(),
-                            MarkerKind.INFO));
-                }
+            // if (bpmnMarker.getElementId().equals(element.getId())) {
+            if (bpmnMarker.getErrorType() == ErrorType.ERROR) {
+                result.add(new Marker(bpmnMarker.getLabel(), bpmnMarker.getDescription(),
+                        bpmnMarker.getElementId(),
+                        MarkerKind.ERROR));
+            } else if (bpmnMarker.getErrorType() == ErrorType.WARNING) {
+                result.add(new Marker(bpmnMarker.getLabel(), bpmnMarker.getDescription(),
+                        bpmnMarker.getElementId(),
+                        MarkerKind.WARNING));
+            } else {
+                result.add(new Marker(bpmnMarker.getLabel(), bpmnMarker.getDescription(),
+                        bpmnMarker.getElementId(),
+                        MarkerKind.INFO));
             }
+            // }
         }
 
         return result;
@@ -200,6 +215,7 @@ public class BPMNGLSPValidator implements ModelValidator {
     @Override
     public List<Marker> doLiveValidation(GModelElement element) {
 
+        // Convert markers
         List<Marker> result = new ArrayList<>();
         for (BPMNValidationMarker bpmnMarker : bpmnMarkers) {
             if (bpmnMarker.getElementId().equals(element.getId())) {
