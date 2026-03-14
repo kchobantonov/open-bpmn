@@ -48,7 +48,7 @@ interface WayPointData {
  * existing routing points.
  */
 export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
-    private debugMode: boolean = false;
+    private debugMode: boolean = true;
     private originWayPointData: WayPointData[];
 
       /**
@@ -70,7 +70,7 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
     protected override getOptions(edge: GRoutableElement): ManhattanRouterOptions {
         return {
             standardDistance: 20, // 20
-            minimalPointDistance:3, // 3  | 25
+            minimalPointDistance:3, // 3  | 20
             selfEdgeOffset: 0.25  // 0.25
         };
     }
@@ -83,12 +83,10 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
      * @returns
      */
     override route(edge: GRoutableElement): RoutedPoint[] {
-        // Validate edge structure completely
         if (!edge.source || !edge.target) {
             this.debug('No source or target - returning empty array');
             return [];
         }
-        // Validate bounds existence and validity
         if (!edge.source.bounds || !edge.target.bounds) {
             this.debug('Invalid bounds on source or target - returning empty array');
             return [];
@@ -103,8 +101,9 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
         if (!currentWayPointData) {
             return super.route(edge);
         }
+          
 
-        this.debug('start routing '+edge.id);
+        this.debug('start routing ' + edge.id);
         let completeRoute;
         try {
             completeRoute = super.route(edge);
@@ -113,7 +112,7 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
             return [];
         }
 
-        // validate route
+
         if (!completeRoute || completeRoute.length < 2) {
             this.debug('Invalid route returned from super - length: ' + completeRoute?.length);
             return super.route(edge);
@@ -123,13 +122,12 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
 
         if (!currentWayPointData.originRoute) {
             currentWayPointData.originRoute = [...completeRoute];
-            this.debugPoints('Set origin Route for '+edge.id, currentWayPointData.originRoute);
+            this.debugPoints('Set origin Route for ' + edge.id, currentWayPointData.originRoute);
         } else {
             if (currentWayPointData.originRoute.length === 2) {
                 currentWayPointData.originRoute = [...completeRoute];
                 return super.route(edge);
             } else {
-                // VALIDIERUNG: Prüfe ob originRoute gültig ist
                 if (!currentWayPointData.originRoute || currentWayPointData.originRoute.length < 2) {
                     this.debug('Invalid originRoute - resetting');
                     this.resetWayPointData();
@@ -138,36 +136,30 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
                 this.debugPoints('Restore origin Route.....', currentWayPointData.originRoute);
                 completeRoute = [...currentWayPointData.originRoute];
 
-                // validate all points
                 const allPointsValid = completeRoute.every(point =>
                     point && typeof point.x === 'number' && typeof point.y === 'number'
                 );
-
                 if (!allPointsValid) {
                     this.debug('Invalid points in route - resetting');
                     this.resetWayPointData();
                     return super.route(edge);
                 }
-                this.debugFine('Adjusting routing points...');
 
-                // Determine if the source or target is being moved
+                this.debugFine('Adjusting routing points...');
                 const isSourceMoving = currentWayPointData.kind === 'source';
                 const element = isSourceMoving ? edge.source : edge.target;
 
-                // Calculate offsets
                 const verticalOffset = element.bounds.y - currentWayPointData.elementPoint.y;
                 const horizontalOffset = element.bounds.x - currentWayPointData.elementPoint.x;
                 this.debugFinest(`offset=${horizontalOffset},${verticalOffset}`);
 
-                // Determine the index to adjust routing points (first point for source, last point for target)
                 const startIndex = isSourceMoving ? 0 : completeRoute.length - 1;
                 const routeIndex = startIndex + (isSourceMoving ? 1 : -1);
 
-                // Check if this segment is horizontal or vertical
                 const isHorizontalSegment = Math.abs(completeRoute[startIndex].x - completeRoute[routeIndex].x) >
                     Math.abs(completeRoute[startIndex].y - completeRoute[routeIndex].y);
                 this.debugFinest(isHorizontalSegment ? 'horizontal segment!' : 'vertical segment!');
-                // Adjust the routing points based on the segment type
+
                 completeRoute[startIndex] = {
                     ...completeRoute[startIndex],
                     x: completeRoute[startIndex].x + horizontalOffset,
@@ -179,23 +171,90 @@ export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
                     y: isHorizontalSegment ? completeRoute[routeIndex].y + verticalOffset : completeRoute[routeIndex].y
                 };
 
-                // Collision-Check
-                // if the first routingPoint is inside the element, reset WayPointData!
+                // Existing collision check
                 if (Bounds.includes(element.bounds, completeRoute[routeIndex])) {
                     this.debug('Collision with nearest routing point detected - reset waypoint data!');
                     this.resetWayPointData();
                     edge.routingPoints = completeRoute;
                     return completeRoute;
                 }
+ 
+                // *** NEU: Entferne Routing-Punkte die das Element "überholt" hat ***
+                completeRoute = this.trimSwallowedPoints(completeRoute, element.bounds, isSourceMoving);
+
             }
         }
 
-        // optimize route be removing clusters
-        completeRoute=this.collapseRoute(completeRoute);
-        completeRoute=this.collapseLoops(completeRoute);
-        // Update the edge's routing points and return the complete route
+        completeRoute = this.collapseRoute(completeRoute);
+        completeRoute = this.collapseLoops(completeRoute);
         edge.routingPoints = completeRoute;
         return completeRoute;
+    }
+
+    /**
+     * Removes routing points that the moved element has "swallowed" —
+     * i.e. points that now lie geometrically between the element and the
+     * rest of the route, causing the edge to double back on itself.
+     *
+     * We iterate from the anchor side inward and remove points as long as
+     * they are closer to the element center than the anchor point itself.
+     *
+     * @param route      The current route (already anchor-adjusted)
+     * @param elementBounds  Bounds of the element being moved
+     * @param fromSource     true if source is moving, false if target is moving
+     */
+    protected trimSwallowedPoints(
+        route: RoutedPoint[],
+        elementBounds: Bounds,
+        fromSource: boolean
+    ): RoutedPoint[] {
+        const result = [...route];
+        const elementCenter = Bounds.center(elementBounds);
+
+        if (fromSource) {
+            // Anchor is at index 0, next inner points are at 1, 2, ...
+            // Keep removing index 1 as long as it is "swallowed"
+            while (result.length > 2) {
+                const anchor = result[0];
+                const candidate = result[1];
+
+                const distAnchorToCenter =
+                    Math.abs(anchor.x - elementCenter.x) +
+                    Math.abs(anchor.y - elementCenter.y);
+                const distCandidateToCenter =
+                    Math.abs(candidate.x - elementCenter.x) +
+                    Math.abs(candidate.y - elementCenter.y);
+
+                // The candidate is "behind" the anchor → remove it
+                if (distCandidateToCenter < distAnchorToCenter) {
+                    this.debug(`trimSwallowedPoints: removing source-side point x=${candidate.x} y=${candidate.y}`);
+                    result.splice(1, 1);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Anchor is at last index, next inner points are at length-2, length-3, ...
+            while (result.length > 2) {
+                const anchor = result[result.length - 1];
+                const candidate = result[result.length - 2];
+
+                const distAnchorToCenter =
+                    Math.abs(anchor.x - elementCenter.x) +
+                    Math.abs(anchor.y - elementCenter.y);
+                const distCandidateToCenter =
+                    Math.abs(candidate.x - elementCenter.x) +
+                    Math.abs(candidate.y - elementCenter.y);
+
+                if (distCandidateToCenter < distAnchorToCenter) {
+                    this.debug(`trimSwallowedPoints: removing target-side point x=${candidate.x} y=${candidate.y}`);
+                    result.splice(result.length - 2, 1);
+                } else {
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
         /**
