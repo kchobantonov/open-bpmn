@@ -37,7 +37,7 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
     static readonly KIND = 'manhattan';
 
     // Set to true to enable verbose logging of route() calls
-    private debugMode: boolean = true;
+    private debugMode: boolean = false;
 
     get kind(): string {
         return BPMN2ManhattanRouter.KIND;
@@ -102,7 +102,7 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
      * Otherwise → calculate default corners from source/target geometry.
      * Never writes to edge.routingPoints.
      */
-    protected createRoutedCorners(edge: GRoutableElement): RoutedPoint[] {
+    protected createRoutedCornersOld1(edge: GRoutableElement): RoutedPoint[] {
         const sourceAnchors = new DefaultAnchors(edge.source!, edge.parent, 'source');
         const targetAnchors = new DefaultAnchors(edge.target!, edge.parent, 'target');
 
@@ -119,6 +119,95 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
         }
 
         // Case 2: no routing points → calculate default corners
+        const options = this.getOptions(edge);
+        const bestAnchors = this.getBestConnectionAnchors(sourceAnchors, targetAnchors, options);
+        this.debug(`  createRoutedCorners: default source=${bestAnchors.source} target=${bestAnchors.target}`);
+        const corners = this.calculateCorners(sourceAnchors, targetAnchors, bestAnchors, options);
+
+        return corners.map((corner, index) => ({
+            kind: 'linear' as const,
+            pointIndex: index,
+            x: Math.round(corner.x),
+            y: Math.round(corner.y)
+        }));
+    }
+
+    protected createRoutedCorners(edge: GRoutableElement): RoutedPoint[] {
+        const sourceAnchors = new DefaultAnchors(edge.source!, edge.parent, 'source');
+        const targetAnchors = new DefaultAnchors(edge.target!, edge.parent, 'target');
+
+        if (edge.routingPoints && edge.routingPoints.length > 0) {
+            // Copy points and remove source/target anchor waypoints
+            // (BPMN stores them as first/last waypoint)
+            const points: Point[] = edge.routingPoints.map(rp => ({ x: rp.x, y: rp.y }));
+
+            // Remove leading points inside source bounds
+            while (points.length > 0 && Bounds.includes(sourceAnchors.bounds, points[0])) {
+                this.debug(`createRoutedCorners: removing source-anchor waypoint x=${points[0].x} y=${points[0].y}`);
+                points.shift();
+            }
+            // Remove trailing points inside target bounds
+            while (points.length > 0 && Bounds.includes(targetAnchors.bounds, points[points.length - 1])) {
+                this.debug(`createRoutedCorners: removing target-anchor waypoint x=${points[points.length - 1].x} y=${points[points.length - 1].y}`);
+                points.pop();
+            }
+
+            if (points.length > 0) {
+                this.manhattanify(points);
+
+                // Align first corner to source anchor position
+                const sourceAnchor = this.getTranslatedAnchor(
+                    edge.source!, points[0], edge.parent, edge, edge.sourceAnchorCorrection
+                );
+                // Align last corner to target anchor position
+                const targetAnchor = this.getTranslatedAnchor(
+                    edge.target!, points[points.length - 1], edge.parent, edge, edge.targetAnchorCorrection
+                );
+
+                if (sourceAnchor && targetAnchor) {
+                    if (points.length === 1) {
+                        // Single corner point — determine orientation from source and target anchor
+                        // If source anchor and corner have same x → first segment is vertical
+                        const isVertical = Math.abs(points[0].x - sourceAnchor.x) < 5;
+                        if (isVertical) {
+                            // Vertical first segment → horizontal last segment
+                            // Corner x follows source, corner y follows target
+                            points[0] = { x: sourceAnchor.x, y: targetAnchor.y };
+                        } else {
+                            // Horizontal first segment → vertical last segment
+                            // Corner x follows target, corner y follows source
+                            points[0] = { x: targetAnchor.x, y: sourceAnchor.y };
+                        }
+                    } else {
+                        // Multiple corners — adjust first and last independently
+                        // Adjust first corner
+                        const isFirstVertical = Math.abs(points[0].x - points[1].x) < 1;
+                        if (isFirstVertical) {
+                            points[0] = { x: points[0].x, y: sourceAnchor.y };
+                        } else {
+                            points[0] = { x: sourceAnchor.x, y: points[0].y };
+                        }
+                        // Adjust last corner
+                        const last = points.length - 1;
+                        const isLastVertical = Math.abs(points[last].x - points[last - 1].x) < 1;
+                        if (isLastVertical) {
+                            points[last] = { x: points[last].x, y: targetAnchor.y };
+                        } else {
+                            points[last] = { x: targetAnchor.x, y: points[last].y };
+                        }
+                    }
+                }
+
+                return points.map((rp, index) => ({
+                    kind: 'linear' as const,
+                    pointIndex: index,
+                    x: Math.round(rp.x),
+                    y: Math.round(rp.y)
+                }));
+            }
+        }
+
+        // No valid routing points → calculate default corners
         const options = this.getOptions(edge);
         const bestAnchors = this.getBestConnectionAnchors(sourceAnchors, targetAnchors, options);
         this.debug(`  createRoutedCorners: default source=${bestAnchors.source} target=${bestAnchors.target}`);
@@ -375,9 +464,14 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
      * Keeps all segments orthogonal (Manhattan style).
      */
     override applyInnerHandleMoves(
-        edge: GRoutableElement,
-        moves: ResolvedHandleMove[]
-    ): void {
+        edge: GRoutableElement,  moves: ResolvedHandleMove[]): void {
+
+         // Always log — independent of debugMode
+        console.log(`applyInnerHandleMoves edge=${edge.id} moves=${moves.length}`);
+        moves.forEach(move => {
+            console.log(`  handle kind=${move.handle.kind} index=${move.handle.pointIndex} to=${move.toPosition.x},${move.toPosition.y}`);
+        });
+        
         const route = this.route(edge);
         const routingPoints = edge.routingPoints;
 
@@ -412,7 +506,10 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
                         this.alignY(routingPoints, routingPoints.length - 1, move.toPosition.y);
                     }
                 }
-                this.debugPoints('  routingPoints after move', routingPoints);
+            // *** DEBUG: show routingPoints after each move ***
+            console.log('  routingPoints after align:');
+            routingPoints.forEach((p, i) => console.log(`    [${i}] x=${p.x} y=${p.y}`));
+
             }
         });
     }
