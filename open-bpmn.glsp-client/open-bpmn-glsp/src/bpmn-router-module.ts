@@ -15,11 +15,9 @@
  ********************************************************************************/
 import {
     FeatureModule,
-    GLSPManhattanEdgeRouter,
-    TYPES
+    GLSPManhattanEdgeRouter
 } from '@eclipse-glsp/client';
-import { BPMNManhattanRouter, BPMNRouterMoveListener } from './bpmn-manhattan-router';
-import { BPMN2ManhattanRouter } from './bpmn2-manhattan-router';
+import { BPMNManhattanRouter } from './bpmn-manhattan-router';
 
 export * from './bpmn-manhattan-router';
 export const BPMNRouterModule = new FeatureModule((bind, unbind, isBound, rebind) => {
@@ -27,15 +25,4 @@ export const BPMNRouterModule = new FeatureModule((bind, unbind, isBound, rebind
     bind(BPMNManhattanRouter).toSelf().inSingletonScope();
     // Rebind GLSPManhattanEdgeRouter to BPMNManhattanRouter
     rebind(GLSPManhattanEdgeRouter).toService(BPMNManhattanRouter);
-    // Bind the BPMNMouseListener
-    bind(TYPES.MouseListener).to(BPMNRouterMoveListener);
-});
-
-/**
- * New BPMN 2 Router Module!
- */
-export const BPMN2RouterModule = new FeatureModule((bind, unbind, isBound, rebind) => {
-    bind(BPMN2ManhattanRouter).toSelf().inSingletonScope();
-    rebind(GLSPManhattanEdgeRouter).toService(BPMN2ManhattanRouter);
-    // BPMNRouterMoveListener wird nicht mehr benötigt
 });

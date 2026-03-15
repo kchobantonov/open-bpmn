@@ -1,577 +1,790 @@
 /********************************************************************************
- * Copyright (c) 2019-2020 TypeFox and others.
+ * Copyright (c) 2022 Imixs Software Solutions GmbH and others.
  *
  * This program and the accompanying materials are made available under the
  * terms of the Eclipse Public License v. 2.0 which is available at
  * http://www.eclipse.org/legal/epl-2.0.
  *
- * This Source Code may also be made available under the following Secondary
- * Licenses when the conditions for such availability set forth in the Eclipse
- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
- * with the GNU Classpath Exception which is available at
- * https://www.gnu.org/software/classpath/license.html.
- *
  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
  ********************************************************************************/
-
 import {
-    Action,
+    AbstractEdgeRouter,
     Bounds,
-    findParentByFeature,
-    GLSPManhattanEdgeRouter,
-    GModelElement,
+    DefaultAnchors,
     GRoutableElement,
-    isRoutable,
-    ManhattanRouterOptions,
-    MouseListener,
+    GRoutingHandle,
+    LinearRouteOptions,
     Point,
-    RoutedPoint
+    ResolvedHandleMove,
+    RoutedPoint,
+    Side
 } from '@eclipse-glsp/client';
-import { isBPMNNode } from '@open-bpmn/open-bpmn-model';
-import { inject, injectable } from 'inversify';
+import { injectable } from 'inversify';
 
-/**
- * Interface defining the structure of movement information
- */
-interface WayPointData {
-    kind: string;
-    elementId: string;
-    elementPoint: Point;
-    edgeId: string;
-    originRoute?: RoutedPoint[];
+export interface BPMNRouterOptions extends LinearRouteOptions {
+    standardDistance: number;
 }
 
 /**
- * Enhanced Manhattan Edge Router for BPMN diagrams that preserves user-defined routing points
- * when moving connected elements. This router extends the default Manhattan router to handle
- * element movements while maintaining the Manhattan-style routing (right angles) and respecting
- * existing routing points.
+ * BPMN2ManhattanRouter - A custom Manhattan Edge Router for BPMN diagrams.
+ *
+ * Architecture (based on Sprotty ManhattanEdgeRouter):
+ *
+ * 1. applyInnerHandleMoves() only aligns routing points along their constrained
+ *    axis — no cleanup, no addAdditionalCorner. Identical to Sprotty.
+ *
+ * 2. cleanupRoutingPoints() is called by createRoutedCorners() on a COPY of
+ *    edge.routingPoints (updateHandles=false, addRoutingPoints=true).
+ *    It handles BPMN anchor removal, addAdditionalCorner with handle index
+ *    shifting, and manhattanify. Handle index shifting is applied when
+ *    called with updateHandles=true (e.g. after mouse-up via createRoutingHandles).
+ *
+ * 3. Element movement detection (BPMN extension):
+ *    edgeElementPositions stores the last known source/target bounds per edge.
+ *    If bounds changed → elementMoved=true → applyFollowLogic() adjusts nearest
+ *    corners to follow the moved element. Write-back to edge.routingPoints
+ *    happens only in this case.
+ *    If bounds unchanged → standard Sprotty cleanup path.
+ *
+ * 4. BPMN files store source/target anchors as first/last waypoint.
+ *    cleanupRoutingPoints() removes them via the standard Bounds.includes() check.
  */
-export class BPMNManhattanRouter extends GLSPManhattanEdgeRouter {
-    private debugMode: boolean = true;
-    private originWayPointData: WayPointData[];
+@injectable()
+export class BPMNManhattanRouter extends AbstractEdgeRouter {
 
-      /**
-       * Updates the current movement delta. Called by the MouseListener when an element is being dragged.
-       * @param delta The x,y movement delta
-       * @param elementId ID of the element being moved
-       */
-      public addWayPointData(origin: WayPointData): void {
-        this.originWayPointData?.push(origin);
-        this.debug('addWayPointData - kind=' + origin.kind
-            + ' dockingPoint=' +origin.elementPoint.x + ','+origin.elementPoint.y
-            + ' id=' + origin.edgeId );
-      }
-      public resetWayPointData(): void {
-        this.originWayPointData = [];
-        this.debug('reset WayPointData');
+    static readonly KIND = 'manhattan';
+
+    // Set to true to enable verbose logging
+    private debugMode: boolean = false;
+
+    // Stores the last known source/target positions per edge.
+    // Used to detect element movement vs. handle drags.
+    private edgeElementPositions: Map<string, {
+        sourceX: number, sourceY: number,
+        targetX: number, targetY: number
+    }> = new Map();
+
+    get kind(): string {
+        return BPMNManhattanRouter.KIND;
     }
 
-    protected override getOptions(edge: GRoutableElement): ManhattanRouterOptions {
+    protected getOptions(edge: GRoutableElement): BPMNRouterOptions {
         return {
-            standardDistance: 20, // 20
-            minimalPointDistance:3, // 3  | 20
-            selfEdgeOffset: 0.25  // 0.25
+            standardDistance: 20,
+            minimalPointDistance: 3,
+            selfEdgeOffset: 0.25
         };
     }
 
+    // ──────────────────────────────────────────────
+    // Core routing (Sprotty pattern)
+    // ──────────────────────────────────────────────
+
     /**
-     * The route method overwrite the default behavior of the GLSPManhattanEdgeRouter.
-     * The method restore the default routing and is just adjusting the anchor point
-     * and its next waypoint.
-     * @param edge
-     * @returns
+     * Main entry point called by the framework on every render cycle.
+     * Pure rendering function — never writes to edge.routingPoints directly.
+     * Write-back happens only via commitRoute() or the elementMoved path
+     * in createRoutedCorners().
      */
     override route(edge: GRoutableElement): RoutedPoint[] {
         if (!edge.source || !edge.target) {
-            this.debug('No source or target - returning empty array');
             return [];
         }
+        // Guard against reconnect state where bounds are not yet initialized.
         if (!edge.source.bounds || !edge.target.bounds) {
-            this.debug('Invalid bounds on source or target - returning empty array');
-            return [];
-        }
-        if (edge.source.bounds.width === undefined || edge.source.bounds.height === undefined ||
-            edge.target.bounds.width === undefined || edge.target.bounds.height === undefined) {
-            this.debug('Incomplete bounds data - returning empty array');
             return [];
         }
 
-        const currentWayPointData = this.originWayPointData?.find(origin => origin.edgeId === edge.id);
-        if (!currentWayPointData) {
-            return super.route(edge);
-        }
-          
+        const routedCorners = this.createRoutedCorners(edge);
+        const sourceRefPoint = routedCorners[0] ?? Bounds.center(edge.target.bounds);
+        const targetRefPoint = routedCorners[routedCorners.length - 1] ?? Bounds.center(edge.source.bounds);
 
-        this.debug('start routing ' + edge.id);
-        let completeRoute;
-        try {
-            completeRoute = super.route(edge);
-        } catch (error) {
-            this.debug('Error in super.route(): ' + error);
+        const sourceAnchor = this.getTranslatedAnchor(
+            edge.source, sourceRefPoint, edge.parent, edge, edge.sourceAnchorCorrection
+        );
+        const targetAnchor = this.getTranslatedAnchor(
+            edge.target, targetRefPoint, edge.parent, edge, edge.targetAnchorCorrection
+        );
+
+        if (!sourceAnchor || !targetAnchor) {
             return [];
         }
 
+        const result: RoutedPoint[] = [];
+        result.push({ kind: 'source', ...sourceAnchor });
+        routedCorners.forEach(corner => result.push(corner));
+        result.push({ kind: 'target', ...targetAnchor });
 
-        if (!completeRoute || completeRoute.length < 2) {
-            this.debug('Invalid route returned from super - length: ' + completeRoute?.length);
-            return super.route(edge);
+        this.debug(`route() edge=${edge.id} corners=${routedCorners.length} existingPoints=${edge.routingPoints.length}`);
+        this.debugPoints('  result', result);
+        return result;
+    }
+
+    /**
+     * Computes intermediate corner points.
+     *
+     * Follows Sprotty pattern: works on a COPY of edge.routingPoints,
+     * calls cleanupRoutingPoints(false, true) on the copy.
+     * edge.routingPoints is only written back in the elementMoved case.
+     *
+     * BPMN extension: detects element movement via edgeElementPositions.
+     * If moved → applyFollowLogic() adjusts nearest corners, then
+     * cleanupRoutingPoints(false, false) for basic cleanup without
+     * re-inserting corners. Write-back ensures subsequent route() calls
+     * in the same frame see the updated positions.
+     */
+    protected createRoutedCorners(edge: GRoutableElement): RoutedPoint[] {
+
+        // Guard against reconnect state where source/target exist but bounds
+        // are not yet fully initialized.
+        if (!edge.source?.bounds || !edge.target?.bounds) {
+            return [];
         }
 
-        this.debugFine(`Origin element pos=${edge.source.bounds.x},${edge.source.bounds.y}`);
+        if (edge.routingPoints && edge.routingPoints.length > 0) {
 
-        if (!currentWayPointData.originRoute) {
-            currentWayPointData.originRoute = [...completeRoute];
-            this.debugPoints('Set origin Route for ' + edge.id, currentWayPointData.originRoute);
-        } else {
-            if (currentWayPointData.originRoute.length === 2) {
-                currentWayPointData.originRoute = [...completeRoute];
-                return super.route(edge);
+            // Step 1: Detect element movement (BPMN extension).
+            const srcBounds = edge.source!.bounds;
+            const tgtBounds = edge.target!.bounds;
+            const lastPos = this.edgeElementPositions.get(edge.id);
+            const elementMoved = lastPos !== undefined
+                && (lastPos.sourceX !== srcBounds.x
+                || lastPos.sourceY !== srcBounds.y
+                || lastPos.targetX !== tgtBounds.x
+                || lastPos.targetY !== tgtBounds.y);
+
+            this.edgeElementPositions.set(edge.id, {
+                sourceX: srcBounds.x, sourceY: srcBounds.y,
+                targetX: tgtBounds.x, targetY: tgtBounds.y
+            });
+
+            this.debug(`createRoutedCorners edge=${edge.id} elementMoved=${elementMoved}`);
+
+            // Step 2: Work on a copy (Sprotty pattern).
+            const points = edge.routingPoints.slice();
+
+            if (elementMoved) {
+                // BPMN extension: adjust nearest corners to follow the moved element.
+                // Then basic cleanup (anchor removal only, no corner re-insertion)
+                // to keep the preserved route intact.
+                this.applyFollowLogic(points, edge);
+                this.cleanupRoutingPoints(edge, points, false, false);
+                // Write-back so subsequent route() calls in the same frame
+                // see the updated corner positions.
+                edge.routingPoints = points.map(p => ({
+                    x: Math.round(p.x),
+                    y: Math.round(p.y)
+                }));
             } else {
-                if (!currentWayPointData.originRoute || currentWayPointData.originRoute.length < 2) {
-                    this.debug('Invalid originRoute - resetting');
-                    this.resetWayPointData();
-                    return super.route(edge);
-                }
-                this.debugPoints('Restore origin Route.....', currentWayPointData.originRoute);
-                completeRoute = [...currentWayPointData.originRoute];
+                // Standard Sprotty path: full cleanup including addAdditionalCorner
+                // and manhattanify. No write-back — edge.routingPoints stays unchanged.
+                this.cleanupRoutingPoints(edge, points, false, true);
+            }
 
-                const allPointsValid = completeRoute.every(point =>
-                    point && typeof point.x === 'number' && typeof point.y === 'number'
-                );
-                if (!allPointsValid) {
-                    this.debug('Invalid points in route - resetting');
-                    this.resetWayPointData();
-                    return super.route(edge);
-                }
-
-                this.debugFine('Adjusting routing points...');
-                const isSourceMoving = currentWayPointData.kind === 'source';
-                const element = isSourceMoving ? edge.source : edge.target;
-
-                const verticalOffset = element.bounds.y - currentWayPointData.elementPoint.y;
-                const horizontalOffset = element.bounds.x - currentWayPointData.elementPoint.x;
-                this.debugFinest(`offset=${horizontalOffset},${verticalOffset}`);
-
-                const startIndex = isSourceMoving ? 0 : completeRoute.length - 1;
-                const routeIndex = startIndex + (isSourceMoving ? 1 : -1);
-
-                const isHorizontalSegment = Math.abs(completeRoute[startIndex].x - completeRoute[routeIndex].x) >
-                    Math.abs(completeRoute[startIndex].y - completeRoute[routeIndex].y);
-                this.debugFinest(isHorizontalSegment ? 'horizontal segment!' : 'vertical segment!');
-
-                completeRoute[startIndex] = {
-                    ...completeRoute[startIndex],
-                    x: completeRoute[startIndex].x + horizontalOffset,
-                    y: completeRoute[startIndex].y + verticalOffset
-                };
-                completeRoute[routeIndex] = {
-                    ...completeRoute[routeIndex],
-                    x: isHorizontalSegment ? completeRoute[routeIndex].x : completeRoute[routeIndex].x + horizontalOffset,
-                    y: isHorizontalSegment ? completeRoute[routeIndex].y + verticalOffset : completeRoute[routeIndex].y
-                };
-
-                // Existing collision check
-                if (Bounds.includes(element.bounds, completeRoute[routeIndex])) {
-                    this.debug('Collision with nearest routing point detected - reset waypoint data!');
-                    this.resetWayPointData();
-                    edge.routingPoints = completeRoute;
-                    return completeRoute;
-                }
- 
-                // *** NEU: Entferne Routing-Punkte die das Element "überholt" hat ***
-                completeRoute = this.trimSwallowedPoints(completeRoute, element.bounds, isSourceMoving);
-
+            if (points.length > 0) {
+                return points.map((rp, index) => ({
+                    kind: 'linear' as const,
+                    pointIndex: index,
+                    x: Math.round(rp.x),
+                    y: Math.round(rp.y)
+                }));
             }
         }
 
-        completeRoute = this.collapseRoute(completeRoute);
-        completeRoute = this.collapseLoops(completeRoute);
-        edge.routingPoints = completeRoute;
-        return completeRoute;
+        // No routing points → calculate default corners.
+        const sourceAnchors = new DefaultAnchors(edge.source!, edge.parent, 'source');
+        const targetAnchors = new DefaultAnchors(edge.target!, edge.parent, 'target');
+        const options = this.getOptions(edge);
+        const bestAnchors = this.getBestConnectionAnchors(sourceAnchors, targetAnchors, options);
+        this.debug(`  createRoutedCorners: default source=${bestAnchors.source} target=${bestAnchors.target}`);
+        const corners = this.calculateCorners(sourceAnchors, targetAnchors, bestAnchors, options);
+
+        return corners.map((corner, index) => ({
+            kind: 'linear' as const,
+            pointIndex: index,
+            x: Math.round(corner.x),
+            y: Math.round(corner.y)
+        }));
     }
 
     /**
-     * Removes routing points that the moved element has "swallowed" —
-     * i.e. points that now lie geometrically between the element and the
-     * rest of the route, causing the edge to double back on itself.
+     * Adjusts the nearest corner points when source or target element has moved.
+     * The corner adjacent to the moved element slides along its axis to keep
+     * the route orthogonal.
      *
-     * We iterate from the anchor side inward and remove points as long as
-     * they are closer to the element center than the anchor point itself.
-     *
-     * @param route      The current route (already anchor-adjusted)
-     * @param elementBounds  Bounds of the element being moved
-     * @param fromSource     true if source is moving, false if target is moving
+     * This is the BPMN-specific "follow" logic that replaces Sprotty's default
+     * behavior of recalculating the entire route on element movement.
      */
-    protected trimSwallowedPoints(
-        route: RoutedPoint[],
-        elementBounds: Bounds,
-        fromSource: boolean
-    ): RoutedPoint[] {
-        const result = [...route];
-        const elementCenter = Bounds.center(elementBounds);
+    protected applyFollowLogic(points: Point[], edge: GRoutableElement): void {
+        const sourceAnchor = this.getTranslatedAnchor(
+            edge.source!, points[0], edge.parent, edge, edge.sourceAnchorCorrection
+        );
+        const targetAnchor = this.getTranslatedAnchor(
+            edge.target!, points[points.length - 1], edge.parent, edge, edge.targetAnchorCorrection
+        );
 
-        if (fromSource) {
-            // Anchor is at index 0, next inner points are at 1, 2, ...
-            // Keep removing index 1 as long as it is "swallowed"
-            while (result.length > 2) {
-                const anchor = result[0];
-                const candidate = result[1];
+        if (!sourceAnchor || !targetAnchor) {
+            return;
+        }
 
-                const distAnchorToCenter =
-                    Math.abs(anchor.x - elementCenter.x) +
-                    Math.abs(anchor.y - elementCenter.y);
-                const distCandidateToCenter =
-                    Math.abs(candidate.x - elementCenter.x) +
-                    Math.abs(candidate.y - elementCenter.y);
+        if (points.length === 1) {
+            const isVertical = Math.abs(points[0].x - sourceAnchor.x) < 5;
+            if (isVertical) {
+                points[0] = {
+                    x: sourceAnchor.x,
+                    y: Math.round(Bounds.center(edge.target!.bounds).y)
+                };
+            } else {
+                points[0] = {
+                    x: Math.round(Bounds.center(edge.target!.bounds).x),
+                    y: sourceAnchor.y
+                };
+            }
+        } else {
+            // Adjust first corner to follow source element.
+            const isFirstVertical = Math.abs(points[0].x - points[1].x) < 1;
+            if (isFirstVertical) {
+                points[0] = {
+                    x: points[0].x,
+                    y: Math.round(Bounds.center(edge.source!.bounds).y)
+                };
+            } else {
+                points[0] = {
+                    x: Math.round(Bounds.center(edge.source!.bounds).x),
+                    y: points[0].y
+                };
+            }
+            // Adjust last corner to follow target element.
+            const last = points.length - 1;
+            const isLastVertical = Math.abs(points[last].x - points[last - 1].x) < 1;
+            if (isLastVertical) {
+                points[last] = {
+                    x: points[last].x,
+                    y: Math.round(Bounds.center(edge.target!.bounds).y)
+                };
+            } else {
+                points[last] = {
+                    x: Math.round(Bounds.center(edge.target!.bounds).x),
+                    y: points[last].y
+                };
+            }
+        }
+    }
 
-                // The candidate is "behind" the anchor → remove it
-                if (distCandidateToCenter < distAnchorToCenter) {
-                    this.debug(`trimSwallowedPoints: removing source-side point x=${candidate.x} y=${candidate.y}`);
-                    result.splice(1, 1);
+    // ──────────────────────────────────────────────
+    // Handle management (Sprotty pattern)
+    // ──────────────────────────────────────────────
+
+    /**
+     * Called when the user selects an edge to show routing handles.
+     * Delegates to commitRoute() then creates all handles with fresh indices.
+     */
+    override createRoutingHandles(edge: GRoutableElement): void {
+        const routedPoints = this.route(edge);
+        this.debug(`createRoutingHandles edge=${edge.id} (${routedPoints.length} points)`);
+        this.debugPoints('  routedPoints', routedPoints);
+        this.commitRoute(edge, routedPoints);
+        if (routedPoints.length > 0) {
+            this.addHandle(edge, 'source', 'routing-point', -2);
+            for (let i = 0; i < routedPoints.length - 1; i++) {
+                this.addHandle(edge, 'manhattan-50%', 'volatile-routing-point', i - 1);
+            }
+            this.addHandle(edge, 'target', 'routing-point', routedPoints.length - 2);
+        }
+    }
+
+    /**
+     * Returns the visual position of an inner routing handle (midpoint of segment).
+     */
+    override getInnerHandlePosition(edge: GRoutableElement, route: RoutedPoint[], handle: GRoutingHandle): Point | undefined {
+        if (handle.kind === 'manhattan-50%') {
+            const { start, end } = this.findRouteSegment(edge, route, handle.pointIndex);
+            if (start !== undefined && end !== undefined) {
+                return Point.linear(start, end, 0.5);
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * Called while the user drags a routing handle.
+     *
+     * Follows Sprotty exactly: only aligns the affected routing point(s)
+     * along their constrained axis. No addAdditionalCorner here.
+     * Orthogonality cleanup happens on the next render cycle via
+     * createRoutedCorners() → cleanupRoutingPoints(false, true).
+     *
+     * correctX/correctY snap to adjacent points when within minimalPointDistance
+     * to avoid degenerate zero-length segments.
+     */
+    override applyInnerHandleMoves(edge: GRoutableElement, moves: ResolvedHandleMove[]): void {
+        this.debug(`applyInnerHandleMoves edge=${edge.id} moves=${moves.length}`);
+
+        const route = this.route(edge);
+        const routingPoints = edge.routingPoints;
+        const minimalPointDistance = this.getOptions(edge).minimalPointDistance;
+
+        moves.forEach(move => {
+            const handle = move.handle;
+            const index = handle.pointIndex;
+
+            this.debug(`  handle kind=${handle.kind} index=${index} to=(${move.toPosition.x},${move.toPosition.y})`);
+
+            if (handle.kind === 'manhattan-50%') {
+                const correctedX = this.correctX(routingPoints, index, move.toPosition.x, minimalPointDistance);
+                const correctedY = this.correctY(routingPoints, index, move.toPosition.y, minimalPointDistance);
+
+                if (index < 0) {
+                    // First segment: source anchor → first corner
+                    if (routingPoints.length === 0) {
+                        routingPoints.push({ x: correctedX, y: correctedY });
+                        handle.pointIndex = 0;
+                    } else if (this.almostEquals(route[0].x, route[1].x)) {
+                        this.alignX(routingPoints, 0, correctedX);
+                    } else {
+                        this.alignY(routingPoints, 0, correctedY);
+                    }
+                } else if (index < routingPoints.length - 1) {
+                    // Inner segment: move both endpoints of the segment
+                    if (this.almostEquals(routingPoints[index].x, routingPoints[index + 1].x)) {
+                        this.alignX(routingPoints, index, correctedX);
+                        this.alignX(routingPoints, index + 1, correctedX);
+                    } else {
+                        this.alignY(routingPoints, index, correctedY);
+                        this.alignY(routingPoints, index + 1, correctedY);
+                    }
                 } else {
-                    break;
+                    // Last segment: last corner → target anchor
+                    if (routingPoints.length === 0) {
+                        routingPoints.push({ x: correctedX, y: correctedY });
+                        handle.pointIndex = 0;
+                    } else if (this.almostEquals(route[route.length - 2].x, route[route.length - 1].x)) {
+                        this.alignX(routingPoints, routingPoints.length - 1, correctedX);
+                    } else {
+                        this.alignY(routingPoints, routingPoints.length - 1, correctedY);
+                    }
+                }
+
+                this.debugPoints('  routingPoints after move', routingPoints);
+            }
+        });
+    }
+
+    // ──────────────────────────────────────────────
+    // Routing point cleanup (Sprotty pattern)
+    // ──────────────────────────────────────────────
+
+    /**
+     * Cleans up routing points after a route change.
+     *
+     * Ported from Sprotty ManhattanEdgeRouter.cleanupRoutingPoints():
+     * 1. Remove leading RPs inside source bounds (BPMN anchor removal included)
+     * 2. Remove trailing RPs inside target bounds
+     * 3. Remove degenerate segments shorter than minimalPointDistance
+     * 4. If addRoutingPoints=true: addAdditionalCorner + manhattanify
+     *
+     * updateHandles=true: also shifts handle pointIndices and adds/removes
+     * handle elements on the edge (used by addAdditionalCorner).
+     * updateHandles=false: only modifies the routingPoints array (used during
+     * rendering in createRoutedCorners).
+     */
+    override cleanupRoutingPoints(edge: GRoutableElement,routingPoints: Point[], updateHandles: boolean, addRoutingPoints: boolean ): void {
+
+        // Guard against reconnect state where bounds are not yet available.
+        if (!edge.source?.bounds || !edge.target?.bounds) {
+            return;
+        }
+        const sourceAnchors = new DefaultAnchors(edge.source!, edge.parent, 'source');
+        const targetAnchors = new DefaultAnchors(edge.target!, edge.parent, 'target');
+
+        if (this.resetRoutingPointsOnReconnect(edge, routingPoints, updateHandles, sourceAnchors, targetAnchors)) {
+            return;
+        }
+
+        // Remove leading routing points inside source bounds.
+        // Also removes BPMN source anchor waypoints stored in the BPMN file.
+        for (let i = 0; i < routingPoints.length; i++) {
+            if (Bounds.includes(sourceAnchors.bounds, routingPoints[i])) {
+                routingPoints.splice(0, 1);
+                if (updateHandles) {
+                    this.removeHandle(edge, -1);
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Remove trailing routing points inside target bounds.
+        // Also removes BPMN target anchor waypoints stored in the BPMN file.
+        for (let i = routingPoints.length - 1; i >= 0; i--) {
+            if (Bounds.includes(targetAnchors.bounds, routingPoints[i])) {
+                routingPoints.splice(i, 1);
+                if (updateHandles) {
+                    this.removeHandle(edge, i);
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Remove degenerate segments shorter than minimalPointDistance.
+        if (routingPoints.length >= 2) {
+            const options = this.getOptions(edge);
+            for (let i = routingPoints.length - 2; i >= 0; i--) {
+                if (Point.manhattanDistance(routingPoints[i], routingPoints[i + 1]) < options.minimalPointDistance) {
+                    routingPoints.splice(i, 2);
+                    i--;
+                    if (updateHandles) {
+                        this.removeHandle(edge, i - 1);
+                        this.removeHandle(edge, i);
+                    }
+                }
+            }
+        }
+
+        if (addRoutingPoints) {
+            this.addAdditionalCorner(edge, routingPoints, sourceAnchors, targetAnchors, updateHandles);
+            this.addAdditionalCorner(edge, routingPoints, targetAnchors, sourceAnchors, updateHandles);
+            this.manhattanify(routingPoints);
+        }
+    }
+
+    /**
+     * Removes a routing handle at the given pointIndex from the edge's children.
+     * All handles with a higher pointIndex are shifted down by 1.
+     * Ported from Sprotty ManhattanEdgeRouter.removeHandle().
+     */
+    protected removeHandle(edge: GRoutableElement, pointIndex: number): void {
+        const toBeRemoved: GRoutingHandle[] = [];
+        edge.children.forEach(child => {
+            if (child instanceof GRoutingHandle) {
+                if (child.pointIndex > pointIndex) {
+                    child.pointIndex--;
+                } else if (child.pointIndex === pointIndex) {
+                    toBeRemoved.push(child);
+                }
+            }
+        });
+        toBeRemoved.forEach(child => edge.remove(child));
+    }
+
+    /**
+     * Inserts an additional corner point if the first/last routing point lies
+     * outside the element bounds in the direction of the adjacent segment.
+     *
+     * When updateHandles=true, also shifts all affected handle pointIndices
+     * and adds a new volatile handle for the new segment (Sprotty pattern).
+     * This ensures handles always reference the correct segments after insertion.
+     *
+     * Ported from Sprotty ManhattanEdgeRouter.addAdditionalCorner().
+     */
+    protected addAdditionalCorner(edge: GRoutableElement, points: Point[],
+        currentAnchors: DefaultAnchors, otherAnchors: DefaultAnchors, updateHandles: boolean): void {
+        if (points.length === 0) {
+            return;
+        }
+
+        const isSource = currentAnchors.kind === 'source';
+        const refPoint = isSource ? points[0] : points[points.length - 1];
+        const insertIndex = isSource ? 0 : points.length;
+        // shiftIndex: for source insertion at 0 → -1 (shifts all handles)
+        //             for target insertion at end → points.length-1 (shifts none)
+        const shiftIndex = insertIndex - (isSource ? 1 : 0);
+
+        let isHorizontal: boolean;
+        if (points.length > 1) {
+            isHorizontal = isSource
+                ? this.almostEquals(points[0].x, points[1].x)
+                : this.almostEquals(points[points.length - 1].x, points[points.length - 2].x);
+        } else {
+            const nearestSide = otherAnchors.getNearestSide(refPoint);
+            isHorizontal = nearestSide === Side.TOP || nearestSide === Side.BOTTOM;
+        }
+
+        if (isHorizontal) {
+            const topY = currentAnchors.get(Side.TOP).y;
+            const bottomY = currentAnchors.get(Side.BOTTOM).y;
+            if (refPoint.y < topY || refPoint.y > bottomY) {
+                const newPoint: Point = {
+                    x: currentAnchors.get(Side.TOP).x,
+                    y: refPoint.y
+                };
+                this.debug(`addAdditionalCorner (${currentAnchors.kind}): inserting at x=${newPoint.x} y=${newPoint.y}`);
+                points.splice(insertIndex, 0, newPoint);
+                if (updateHandles) {
+                    edge.children.forEach(child => {
+                        if (child instanceof GRoutingHandle && child.pointIndex >= shiftIndex) {
+                            child.pointIndex++;
+                        }
+                    });
+                    this.addHandle(edge, 'manhattan-50%', 'volatile-routing-point', shiftIndex);
                 }
             }
         } else {
-            // Anchor is at last index, next inner points are at length-2, length-3, ...
-            while (result.length > 2) {
-                const anchor = result[result.length - 1];
-                const candidate = result[result.length - 2];
-
-                const distAnchorToCenter =
-                    Math.abs(anchor.x - elementCenter.x) +
-                    Math.abs(anchor.y - elementCenter.y);
-                const distCandidateToCenter =
-                    Math.abs(candidate.x - elementCenter.x) +
-                    Math.abs(candidate.y - elementCenter.y);
-
-                if (distCandidateToCenter < distAnchorToCenter) {
-                    this.debug(`trimSwallowedPoints: removing target-side point x=${candidate.x} y=${candidate.y}`);
-                    result.splice(result.length - 2, 1);
-                } else {
-                    break;
+            const leftX = currentAnchors.get(Side.LEFT).x;
+            const rightX = currentAnchors.get(Side.RIGHT).x;
+            if (refPoint.x < leftX || refPoint.x > rightX) {
+                const newPoint: Point = {
+                    x: refPoint.x,
+                    y: currentAnchors.get(Side.LEFT).y
+                };
+                this.debug(`addAdditionalCorner (${currentAnchors.kind}): inserting at x=${newPoint.x} y=${newPoint.y}`);
+                points.splice(insertIndex, 0, newPoint);
+                if (updateHandles) {
+                    edge.children.forEach(child => {
+                        if (child instanceof GRoutingHandle && child.pointIndex >= shiftIndex) {
+                            child.pointIndex++;
+                        }
+                    });
+                    this.addHandle(edge, 'manhattan-50%', 'volatile-routing-point', shiftIndex);
                 }
             }
         }
-        return result;
     }
 
-        /**
-     * Collapses a Manhattan route by removing unnecessary intermediate points
-     * that form a local "cluster" (short segments) within the given threshold.
-     *
-     * @param points - The route points (first and last are fixed anchor points)
-     * @param threshold - Maximum length of a segment to collapse (default: 20px)
-     * @returns Optimized route with minimal points
+    /**
+     * Ensures all segments are strictly orthogonal.
+     * Inserts intermediate corner points for any diagonal segments.
      */
-    public collapseRoute(points: RoutedPoint[], threshold = 20): RoutedPoint[] {
-        // Need at least 4 points to have a collapsible segment
-        // (3 points = already optimal L-path)
-        if (points.length <= 3) {
-            return points;
-        }
-        // this.debugMode=true;
-        // this.debugPoints('├── Origin WayPoints: ',originPoints);
-        // this.debugPoints('├── New    WayPoints: ',points);
-
-        let result = [...points];
-        let changed = true;
-
-        // Repeat until no more changes are made
-        // (collapsing one segment might create another short segment)
-        while (changed) {
-            changed = false;
-
-            // Iterate through inner segments only (skip first and last segment)
-            // First segment (0→1) connects to fixed start point
-            // Last segment (n-2→n-1) connects to fixed end point
-            for (let i = 1; i < result.length - 2; i++) {
-                const p1 = result[i];
-                const p2 = result[i + 1];
-
-                // Calculate segment length
-                // For Manhattan routing, segments are either horizontal or vertical
-                const dx = Math.abs(p2.x - p1.x);
-                const dy = Math.abs(p2.y - p1.y);
-                const segmentLength = dx + dy;
-
-                // Skip diagonal segments (should not occur in Manhattan routing)
-                // These require different handling and might indicate a data issue
-                if (dx > 0 && dy > 0) {
-                    continue;
-                }
-
-                if (segmentLength < threshold) {
-                    // Found a short segment → collapse it
-                    const before = result[i - 1];
-                    const after = result[i + 2];
-
-                    // Safety check: ensure 'before' and 'after' exist
-                    if (!before || !after) {
-                        continue;
-                    }
-
-                    // Determine segment direction to calculate the new L-point
-                    // Horizontal segment: same Y values (dy === 0)
-                    // Vertical segment: same X values (dx === 0)
-                    const isHorizontal = dy === 0;
-
-                    // The new L-point connects 'before' to 'after':
-                    // - Horizontal segment → take X from 'after', Y from 'before'
-                    // - Vertical segment   → take X from 'before', Y from 'after'
-                    const lPoint: RoutedPoint = isHorizontal
-                        ? { x: after.x, y: before.y, kind: 'linear' }
-                        : { x: before.x, y: after.y, kind: 'linear' };
-
-                    // Validate: new L-point should create valid Manhattan segments
-                    // Skip if the new point would create a diagonal connection
-                    const createsValidRoute =
-                        (before.x === lPoint.x || before.y === lPoint.y) &&
-                        (after.x === lPoint.x || after.y === lPoint.y);
-
-                    if (!createsValidRoute) {
-                        continue;
-                    }
-
-                    // Replace points[i] and points[i+1] with the new L-point
-                    result = [
-                        ...result.slice(0, i),
-                        lPoint,
-                        ...result.slice(i + 2)
-                    ];
-
-                    changed = true;
-                    break; // Restart from beginning (indices have changed)
-                }
+    protected manhattanify(points: Point[]): void {
+        for (let i = 1; i < points.length; i++) {
+            const isVertical = Math.abs(points[i - 1].x - points[i].x) < 1;
+            const isHorizontal = Math.abs(points[i - 1].y - points[i].y) < 1;
+            if (!isVertical && !isHorizontal) {
+                this.debug(`manhattanify: fixing diagonal at index=${i}`);
+                points.splice(i, 0, { x: points[i - 1].x, y: points[i].y });
+                i++;
             }
         }
+    }
 
-        return result;
+    // ──────────────────────────────────────────────
+    // Default corner calculation
+    // ──────────────────────────────────────────────
+
+    /**
+     * Determines the best sides (TOP/BOTTOM/LEFT/RIGHT) on source and target
+     * for a new default route. Evaluated in priority order:
+     *   1. Direct connections (0 corners)
+     *   2. One-corner connections
+     *   3. Two-corner connections (fallback)
+     */
+    protected getBestConnectionAnchors(sourceAnchors: DefaultAnchors, targetAnchors: DefaultAnchors,
+        options: BPMNRouterOptions): { source: Side, target: Side } {
+        const sd = options.standardDistance;
+
+        // Direct connections (0 corners) ─────────────────────────────────
+        if (targetAnchors.get(Side.LEFT).x - sourceAnchors.get(Side.RIGHT).x > sd) {
+            return { source: Side.RIGHT, target: Side.LEFT };
+        }
+        if (sourceAnchors.get(Side.LEFT).x - targetAnchors.get(Side.RIGHT).x > sd) {
+            return { source: Side.LEFT, target: Side.RIGHT };
+        }
+        if (sourceAnchors.get(Side.TOP).y - targetAnchors.get(Side.BOTTOM).y > sd) {
+            return { source: Side.TOP, target: Side.BOTTOM };
+        }
+        if (targetAnchors.get(Side.TOP).y - sourceAnchors.get(Side.BOTTOM).y > sd) {
+            return { source: Side.BOTTOM, target: Side.TOP };
+        }
+
+        // One-corner connections ──────────────────────────────────────────
+        if (targetAnchors.get(Side.TOP).x - sourceAnchors.get(Side.RIGHT).x > 0.5 * sd
+            && targetAnchors.get(Side.TOP).y - sourceAnchors.get(Side.RIGHT).y > sd) {
+            return { source: Side.RIGHT, target: Side.TOP };
+        }
+        if (targetAnchors.get(Side.BOTTOM).x - sourceAnchors.get(Side.RIGHT).x > 0.5 * sd
+            && sourceAnchors.get(Side.RIGHT).y - targetAnchors.get(Side.BOTTOM).y > sd) {
+            return { source: Side.RIGHT, target: Side.BOTTOM };
+        }
+        if (sourceAnchors.get(Side.LEFT).x - targetAnchors.get(Side.BOTTOM).x > 0.5 * sd
+            && sourceAnchors.get(Side.LEFT).y - targetAnchors.get(Side.BOTTOM).y > sd) {
+            return { source: Side.LEFT, target: Side.BOTTOM };
+        }
+        if (sourceAnchors.get(Side.LEFT).x - targetAnchors.get(Side.TOP).x > 0.5 * sd
+            && targetAnchors.get(Side.TOP).y - sourceAnchors.get(Side.LEFT).y > sd) {
+            return { source: Side.LEFT, target: Side.TOP };
+        }
+        if (targetAnchors.get(Side.RIGHT).y - sourceAnchors.get(Side.BOTTOM).y > 0.5 * sd
+            && sourceAnchors.get(Side.BOTTOM).x - targetAnchors.get(Side.RIGHT).x > sd) {
+            return { source: Side.BOTTOM, target: Side.RIGHT };
+        }
+        if (targetAnchors.get(Side.LEFT).y - sourceAnchors.get(Side.BOTTOM).y > 0.5 * sd
+            && targetAnchors.get(Side.LEFT).x - sourceAnchors.get(Side.BOTTOM).x > sd) {
+            return { source: Side.BOTTOM, target: Side.LEFT };
+        }
+
+        // Two-corner connections (fallback) ───────────────────────────────
+        const srcTop = sourceAnchors.get(Side.TOP);
+        const tgtTop = targetAnchors.get(Side.TOP);
+        if (!Bounds.includes(targetAnchors.bounds, srcTop)
+            && !Bounds.includes(sourceAnchors.bounds, tgtTop)) {
+            return { source: Side.TOP, target: Side.TOP };
+        }
+        const srcRight = sourceAnchors.get(Side.RIGHT);
+        const tgtRight = targetAnchors.get(Side.RIGHT);
+        if (!Bounds.includes(targetAnchors.bounds, srcRight)
+            && !Bounds.includes(sourceAnchors.bounds, tgtRight)) {
+            return { source: Side.RIGHT, target: Side.RIGHT };
+        }
+
+        return { source: Side.RIGHT, target: Side.LEFT };
     }
 
     /**
-     * Collapses loops in a Manhattan route by finding self-intersections
-     * and creating shortcuts at crossing points.
-     *
-     * @param points - The route points (first and last are fixed anchor points)
-     * @param threshold - Not used currently, kept for API consistency
-     * @returns Optimized route with loops removed
+     * Calculates corner points for a new default route between two sides.
+     * Returns 0, 1, or 2 corner points depending on relative geometry.
      */
-    public collapseLoops(points: RoutedPoint[]): RoutedPoint[] {
-        // Need at least 4 points for a possible self-intersection
-        // (a loop requires at least 4 segments)
-        if (points.length <= 3) {
-            return points;
-        }
+    protected calculateCorners(sourceAnchors: DefaultAnchors, targetAnchors: DefaultAnchors,
+        sides: { source: Side, target: Side }, options: BPMNRouterOptions ): Point[] {
+        const src = sourceAnchors.get(sides.source);
+        const tgt = targetAnchors.get(sides.target);
+        const sd = options.standardDistance;
 
-        let result = [...points];
-        let changed = true;
-
-        // Repeat until no more crossings are found
-        while (changed) {
-            changed = false;
-
-            // Iterate through all segment pairs (i, j) where j > i+1
-            // We skip adjacent segments (they share a point, not a crossing)
-            for (let i = 0; i < result.length - 3 && !changed; i++) {
-                const a1 = result[i];
-                const a2 = result[i + 1];
-
-                for (let j = i + 2; j < result.length - 1 && !changed; j++) {
-                    const b1 = result[j];
-                    const b2 = result[j + 1];
-
-                    const crossing = this.findCrossing(a1, a2, b1, b2);
-
-                    if (crossing) {
-                        // Found a crossing! Create shortcut.
-                        // Keep points 0..i, add crossing point, then j+1..end
-                        const crossingPoint: RoutedPoint = {
-                            x: crossing.x,
-                            y: crossing.y,
-                            kind: 'linear'
-                        };
-
-                        result = [
-                            ...result.slice(0, i + 1),    // Start up to and including point i
-                            crossingPoint,                 // The new crossing point
-                            ...result.slice(j + 1)         // From point after segment j to end
-                        ];
-
-                        changed = true;
+        switch (sides.source) {
+            case Side.RIGHT:
+                switch (sides.target) {
+                    case Side.LEFT: {
+                        if (src.y !== tgt.y) {
+                            const midX = Math.round((src.x + tgt.x) / 2);
+                            return [{ x: midX, y: src.y }, { x: midX, y: tgt.y }];
+                        }
+                        return [];
+                    }
+                    case Side.TOP:
+                    case Side.BOTTOM:
+                        return [{ x: tgt.x, y: src.y }];
+                    case Side.RIGHT: {
+                        const maxX = Math.round(Math.max(src.x, tgt.x) + 1.5 * sd);
+                        return [{ x: maxX, y: src.y }, { x: maxX, y: tgt.y }];
                     }
                 }
-            }
+                break;
+
+            case Side.LEFT:
+                switch (sides.target) {
+                    case Side.RIGHT: {
+                        if (src.y !== tgt.y) {
+                            const midX = Math.round((src.x + tgt.x) / 2);
+                            return [{ x: midX, y: src.y }, { x: midX, y: tgt.y }];
+                        }
+                        return [];
+                    }
+                    case Side.TOP:
+                    case Side.BOTTOM:
+                        return [{ x: tgt.x, y: src.y }];
+                    default: {
+                        const minX = Math.round(Math.min(src.x, tgt.x) - 1.5 * sd);
+                        return [{ x: minX, y: src.y }, { x: minX, y: tgt.y }];
+                    }
+                }
+
+            case Side.TOP:
+                switch (sides.target) {
+                    case Side.BOTTOM: {
+                        if (src.x !== tgt.x) {
+                            const midY = Math.round((src.y + tgt.y) / 2);
+                            return [{ x: src.x, y: midY }, { x: tgt.x, y: midY }];
+                        }
+                        return [];
+                    }
+                    case Side.TOP: {
+                        const minY = Math.round(Math.min(src.y, tgt.y) - 1.5 * sd);
+                        return [{ x: src.x, y: minY }, { x: tgt.x, y: minY }];
+                    }
+                    case Side.RIGHT:
+                    case Side.LEFT:
+                        return [{ x: src.x, y: tgt.y }];
+                }
+                break;
+
+            case Side.BOTTOM:
+                switch (sides.target) {
+                    case Side.TOP: {
+                        if (src.x !== tgt.x) {
+                            const midY = Math.round((src.y + tgt.y) / 2);
+                            return [{ x: src.x, y: midY }, { x: tgt.x, y: midY }];
+                        }
+                        return [];
+                    }
+                    case Side.BOTTOM: {
+                        const maxY = Math.round(Math.max(src.y, tgt.y) + 1.5 * sd);
+                        return [{ x: src.x, y: maxY }, { x: tgt.x, y: maxY }];
+                    }
+                    case Side.RIGHT:
+                    case Side.LEFT:
+                        return [{ x: src.x, y: tgt.y }];
+                }
+                break;
         }
 
-        return result;
+        const midX = Math.round((src.x + tgt.x) / 2);
+        return [{ x: midX, y: src.y }, { x: midX, y: tgt.y }];
+    }
+
+    // ──────────────────────────────────────────────
+    // Helper methods (Sprotty pattern)
+    // ──────────────────────────────────────────────
+
+    /**
+     * Snaps x to the adjacent routing point's x if within minimalPointDistance.
+     * Prevents degenerate zero-length segments during handle drags.
+     */
+    protected correctX(routingPoints: Point[], index: number, x: number, minimalPointDistance: number): number {
+        if (index > 0 && Math.abs(x - routingPoints[index - 1].x) < minimalPointDistance) {
+            return routingPoints[index - 1].x;
+        } else if (index < routingPoints.length - 2
+            && Math.abs(x - routingPoints[index + 2].x) < minimalPointDistance) {
+            return routingPoints[index + 2].x;
+        }
+        return x;
     }
 
     /**
-     * Finds the crossing point of two Manhattan segments, if they intersect.
-     * One segment must be horizontal, the other vertical.
-     *
-     * @returns The crossing point, or null if segments don't cross
+     * Snaps y to the adjacent routing point's y if within minimalPointDistance.
      */
-    private findCrossing(a1: RoutedPoint, a2: RoutedPoint, b1: RoutedPoint, b2: RoutedPoint): RoutedPoint | undefined {
-        // Determine which segment is horizontal and which is vertical
-        const aIsHorizontal = a1.y === a2.y;
-        const aIsVertical = a1.x === a2.x;
-        const bIsHorizontal = b1.y === b2.y;
-        const bIsVertical = b1.x === b2.x;
-
-        // We need one horizontal and one vertical segment
-        if (aIsHorizontal && bIsVertical) {
-            return this.checkCrossing(
-                a1.x, a2.x, a1.y,  // horizontal segment: x range and y value
-                b1.y, b2.y, b1.x   // vertical segment: y range and x value
-            );
-        } else if (aIsVertical && bIsHorizontal) {
-            return this.checkCrossing(
-                b1.x, b2.x, b1.y,  // horizontal segment: x range and y value
-                a1.y, a2.y, a1.x   // vertical segment: y range and x value
-            );
+    protected correctY(routingPoints: Point[], index: number, y: number, minimalPointDistance: number): number {
+        if (index > 0 && Math.abs(y - routingPoints[index - 1].y) < minimalPointDistance) {
+            return routingPoints[index - 1].y;
+        } else if (index < routingPoints.length - 2
+            && Math.abs(y - routingPoints[index + 2].y) < minimalPointDistance) {
+            return routingPoints[index + 2].y;
         }
-
-        // Both horizontal or both vertical → no crossing possible
-        return undefined;
+        return y;
     }
 
-    /**
-     * Checks if a horizontal and vertical segment cross each other.
-     *
-     * @param hx1, hx2 - X range of horizontal segment
-     * @param hy - Y value of horizontal segment
-     * @param vy1, vy2 - Y range of vertical segment
-     * @param vx - X value of vertical segment
-     * @returns The crossing point, or null if no crossing
-     */
-    private checkCrossing(hx1: number, hx2: number, hy: number, vy1: number, vy2: number, vx: number): RoutedPoint | undefined {
-        // Get proper min/max ranges
-        const hxMin = Math.min(hx1, hx2);
-        const hxMax = Math.max(hx1, hx2);
-        const vyMin = Math.min(vy1, vy2);
-        const vyMax = Math.max(vy1, vy2);
-
-        // Check if vertical segment's X is within horizontal segment's X range
-        // AND horizontal segment's Y is within vertical segment's Y range
-        // Using strict inequality (<, >) to exclude touching at endpoints
-        if (vx > hxMin && vx < hxMax && hy > vyMin && hy < vyMax) {
-            return { x: vx, y: hy, kind: 'linear' };
-        }
-
-        return undefined;
+    protected almostEquals(a: number, b: number): boolean {
+        return Math.abs(a - b) < 1;
     }
 
-    /**
-     * Helper Debug Methods
-     *
-     * @param routedPoints
-     */
-    public debugPoints(message: string, points: Point[]): void {
+    protected alignX(points: Point[], index: number, x: number): void {
+        if (index >= 0 && index < points.length) {
+            points[index] = { x, y: points[index].y };
+        }
+    }
+
+    protected alignY(points: Point[], index: number, y: number): void {
+        if (index >= 0 && index < points.length) {
+            points[index] = { x: points[index].x, y };
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Debug methods
+    // ──────────────────────────────────────────────
+
+    protected debug(message: string): void {
         if (this.debugMode) {
-            console.log('├── '+message);
-            points.forEach(point => {
-                console.log('│   ├── x=' + point.x + ' y=' + point.y);
+            console.log('├── ' + message);
+        }
+    }
+
+    protected debugPoints(label: string, points: { x: number; y: number; kind?: string }[]): void {
+        if (this.debugMode) {
+            console.log('│   ├── ' + label + ' (' + points.length + ')');
+            points.forEach((p, i) => {
+                const kind = 'kind' in p ? ` kind=${p.kind}` : '';
+                console.log(`│   │   ├── [${i}]${kind} x=${p.x} y=${p.y}`);
             });
         }
-    }
-    public debug(message: string): void {
-        if (this.debugMode) {
-               console.log('├── '+message);
-        }
-    }
-    public debugFine(message: string): void {
-        if (this.debugMode) {
-               console.log('│   ├── '+message);
-        }
-    }
-    public debugFinest(message: string): void {
-        if (this.debugMode) {
-               console.log('│   │   ├── '+message);
-        }
-    }
-}
-/**
- * Mouse listener that tracks the movement of connectable elements (nodes that can have edges)
- * and communicates these movements to the BPMNManhattanRouter. This enables the router to
- * adjust edge routes in real-time as elements are being moved.
- */
-@injectable()
-export class BPMNRouterMoveListener extends MouseListener {
-    protected isDragging = false;
-    @inject(BPMNManhattanRouter)
-    protected router: BPMNManhattanRouter;
-
-    /**
-     * Handles mouse button press. Starts tracking if:
-     * 1. It's a left mouse button press
-     * 2. The target is a connectable element
-     *
-     * @param target The element under the mouse
-     * @param event Mouse event
-     */
-    override mouseDown(target: GModelElement, event: MouseEvent): Action[] {
-        if (event.button === 0) { // left mouse button
-            // Only track connectable elements
-            let targetElement = target;
-            if (!isBPMNNode(targetElement)) {
-                const bpmnNode = findParentByFeature(targetElement, isBPMNNode);
-                if (bpmnNode) {
-                    targetElement = bpmnNode;
-                }
-            }
-            // do we have a BPMN node?
-            if (isBPMNNode(targetElement)) {
-                // reset origins!
-                this.router.resetWayPointData();
-                this.router.debug('├── Mouse Down - Element: '+target.id + ' pos= x:'
-                     + targetElement.bounds.x + ' y:'+targetElement.bounds.y);
-                this.isDragging = true;
-
-                // Collect all affected edges
-                if (targetElement.incomingEdges) {
-                    targetElement.incomingEdges.forEach(edge => {
-                        if (isRoutable(edge)) {
-                            this.router.addWayPointData({
-                                kind: 'target',
-                                elementId: targetElement.id,
-                                elementPoint: {x: targetElement.bounds.x, y:  targetElement.bounds.y },
-                                edgeId: edge.id
-                            });
-                        }
-                    });
-                }
-                if (targetElement.outgoingEdges) {
-                    targetElement.outgoingEdges.forEach(edge => {
-                        this.router.debugFine('  routing point count='+ edge.routingPoints.length);
-                        if (isRoutable(edge)) {
-                            this.router.addWayPointData({
-                                kind: 'source',
-                                elementId: targetElement.id,
-                                elementPoint: {x: targetElement.bounds.x, y:  targetElement.bounds.y },
-                                edgeId:edge.id
-                            });
-                        }
-                    });
-                }
-            }
-        }
-        return [];
-    }
-
-    /**
-     * Handles mouse button release. Cleans up tracking state.
-     *
-     * @param target The element under the mouse
-     * @param event Mouse event
-     */
-    override mouseUp(target: GModelElement, event: MouseEvent): Action[] {
-        if (this.isDragging) {
-            this.isDragging = false;
-            this.router.resetWayPointData();
-        }
-        return [];
     }
 }

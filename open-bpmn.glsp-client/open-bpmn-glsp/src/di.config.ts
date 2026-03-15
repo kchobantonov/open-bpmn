@@ -84,7 +84,7 @@ import {
     TaskNodeView,
     TextAnnotationNodeView
 } from './bpmn-element-views';
-import { BPMN2RouterModule } from './bpmn-router-module';
+import { BPMNRouterModule } from './bpmn-router-module';
 import { BPMNEdgeView } from './bpmn-routing-views';
 import {
     BPMNMultiNodeSelectionListener,
@@ -186,6 +186,6 @@ export function initializeBPMNDiagramContainer(container: Container,
         bpmnDiagramModule,
         helperLineModule,
         BPMNPropertyModule,
-        BPMN2RouterModule,
+        BPMNRouterModule,
         ...containerConfiguration);
 }
