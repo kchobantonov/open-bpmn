@@ -58,7 +58,7 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
     static readonly KIND = 'manhattan';
 
     // Set to true to enable verbose logging
-    private debugMode: boolean = false;
+    private debugMode: boolean = true;
 
     // Stores the last known source/target positions per edge.
     // Used to detect element movement vs. handle drags.
@@ -74,7 +74,7 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
     protected getOptions(edge: GRoutableElement): BPMN2RouterOptions {
         return {
             standardDistance: 20,
-            minimalPointDistance: 20,
+            minimalPointDistance: 4,
             selfEdgeOffset: 0.25
         };
     }
@@ -181,11 +181,13 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
                 const srcBounds = edge.source!.bounds;
                 const tgtBounds = edge.target!.bounds;
                 const lastPos = this.edgeElementPositions.get(edge.id);
-                const elementMoved = !lastPos
-                    || lastPos.sourceX !== srcBounds.x
+                // When lastPos is null, this is the first time we see this edge.
+                // Treat as no movement — just record current position.
+                const elementMoved = lastPos !== undefined
+                    && (lastPos.sourceX !== srcBounds.x
                     || lastPos.sourceY !== srcBounds.y
                     || lastPos.targetX !== tgtBounds.x
-                    || lastPos.targetY !== tgtBounds.y;
+                    || lastPos.targetY !== tgtBounds.y);
 
                 // Always update stored positions for next render cycle
                 this.edgeElementPositions.set(edge.id, {
@@ -264,11 +266,12 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
                     edge.routingPoints = points.map(p => ({ x: Math.round(p.x), y: Math.round(p.y) }));
 
                 } else {
-                    // Step 3b: Element did NOT move → user is dragging a handle.
-                    // Insert additional corners if routing points lie outside
-                    // element bounds due to the handle drag.
+                    // Element did NOT move → user is dragging a routing handle.
+                    // addAdditionalCorner ensures orthogonality when new corners are needed.
+                    // Write back so handle indices stay in sync with rendered corners.
                     this.addAdditionalCorner(points, sourceAnchors, targetAnchors);
                     this.addAdditionalCorner(points, targetAnchors, sourceAnchors);
+                    edge.routingPoints = points.map(p => ({ x: Math.round(p.x), y: Math.round(p.y) }));
                 }
 
                 // Step 4: Fix any remaining diagonal segments.
@@ -642,9 +645,14 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
 
             if (handle.kind === 'manhattan-50%') {
                 if (index < 0) {
-                    // Handle is before the first routing point (first segment)
+                    // First segment: source anchor → first corner
                     if (routingPoints.length === 0) {
-                        routingPoints.push({ x: move.toPosition.x, y: move.toPosition.y });
+                        // No routing points yet → push ONE point at drag position
+                        // addAdditionalCorner will create the proper L-shape
+                        routingPoints.push({
+                            x: Math.round(move.toPosition.x),
+                            y: Math.round(move.toPosition.y)
+                        });
                         handle.pointIndex = 0;
                     } else if (this.isVerticalSegment(route[0], route[1])) {
                         this.alignX(routingPoints, 0, move.toPosition.x);
@@ -652,7 +660,7 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
                         this.alignY(routingPoints, 0, move.toPosition.y);
                     }
                 } else if (index < routingPoints.length - 1) {
-                    // Handle is between two routing points (inner segment)
+                    // Inner segment
                     if (this.isVerticalSegment(routingPoints[index], routingPoints[index + 1])) {
                         this.alignX(routingPoints, index, move.toPosition.x);
                         this.alignX(routingPoints, index + 1, move.toPosition.x);
@@ -661,9 +669,16 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
                         this.alignY(routingPoints, index + 1, move.toPosition.y);
                     }
                 } else {
-                    // Handle is after the last routing point (last segment)
+                    // Last segment: last corner → target anchor
                     const last = route.length - 1;
-                    if (this.isVerticalSegment(route[last - 1], route[last])) {
+                    if (routingPoints.length === 0) {
+                        // No routing points yet → push ONE point at drag position
+                        routingPoints.push({
+                            x: Math.round(move.toPosition.x),
+                            y: Math.round(move.toPosition.y)
+                        });
+                        handle.pointIndex = 0;
+                    } else if (this.isVerticalSegment(route[last - 1], route[last])) {
                         this.alignX(routingPoints, routingPoints.length - 1, move.toPosition.x);
                     } else {
                         this.alignY(routingPoints, routingPoints.length - 1, move.toPosition.y);
