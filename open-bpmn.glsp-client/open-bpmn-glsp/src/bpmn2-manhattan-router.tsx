@@ -90,6 +90,10 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
         if (!edge.source || !edge.target) {
             return [];
         }
+        // Guard against reconnect state where bounds are not yet initialized.
+        if (!edge.source.bounds || !edge.target.bounds) {
+            return [];
+        }
 
         const routedCorners = this.createRoutedCorners(edge);
         const sourceRefPoint = routedCorners[0] ?? Bounds.center(edge.target.bounds);
@@ -130,6 +134,13 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
      * in the same frame see the updated positions.
      */
     protected createRoutedCorners(edge: GRoutableElement): RoutedPoint[] {
+
+        // Guard against reconnect state where source/target exist but bounds
+        // are not yet fully initialized.
+        if (!edge.source?.bounds || !edge.target?.bounds) {
+            return [];
+        }
+
         if (edge.routingPoints && edge.routingPoints.length > 0) {
 
             // Step 1: Detect element movement (BPMN extension).
@@ -390,6 +401,11 @@ export class BPMN2ManhattanRouter extends AbstractEdgeRouter {
         updateHandles: boolean,
         addRoutingPoints: boolean
     ): void {
+
+        // Guard against reconnect state where bounds are not yet available.
+        if (!edge.source?.bounds || !edge.target?.bounds) {
+            return;
+        }
         const sourceAnchors = new DefaultAnchors(edge.source!, edge.parent, 'source');
         const targetAnchors = new DefaultAnchors(edge.target!, edge.parent, 'target');
 
