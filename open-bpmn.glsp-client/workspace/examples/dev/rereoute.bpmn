@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<bpmn2:definitions xmlns:bpmn2="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:open-bpmn="http://open-bpmn.org/XMLSchema" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" exporter="org.openbpmn" exporterVersion="1.0.0" targetNamespace="http://open-bpmn.org">
+  <bpmn2:process id="process_1" name="Default Process" processType="Public">
+    <bpmn2:documentation id="documentation_qSnNjQ"/>
+    <bpmn2:extensionElements>
+      <open-bpmn:auto-align/>
+    </bpmn2:extensionElements>
+    <bpmn2:endEvent id="event_Np5zHQ" name="Event-2">
+      <bpmn2:documentation id="documentation_rTJddA"/>
+      <bpmn2:incoming>sequenceFlow_zZ4F6A</bpmn2:incoming>
+    </bpmn2:endEvent>
+    <bpmn2:task id="task_RF12Cw" name="Task-1">
+      <bpmn2:documentation id="documentation_V2Fd8g"/>
+      <bpmn2:outgoing>sequenceFlow_zZ4F6A</bpmn2:outgoing>
+    </bpmn2:task>
+    <bpmn2:sequenceFlow id="sequenceFlow_zZ4F6A" sourceRef="task_RF12Cw" targetRef="event_Np5zHQ">
+      <bpmn2:documentation id="documentation_0vN86w"/>
+    </bpmn2:sequenceFlow>
+  </bpmn2:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="OpenBPMN Diagram">
+    <bpmndi:BPMNPlane bpmnElement="process_1" id="BPMNPlane_1">
+      <bpmndi:BPMNShape bpmnElement="event_Np5zHQ" id="BPMNShape_YF7hNw">
+        <dc:Bounds height="36.0" width="36.0" x="442.0" y="332.0"/>
+        <bpmndi:BPMNLabel id="BPMNLabel_aBU7GA">
+          <dc:Bounds height="20.0" width="100.0" x="410.0" y="371.0"/>
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="task_RF12Cw" id="BPMNShape_jWDleQ">
+        <dc:Bounds height="50.0" width="110.0" x="239.0" y="185.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_zZ4F6A" id="BPMNEdge_gvUlZA" sourceElement="BPMNShape_jWDleQ" targetElement="BPMNShape_YF7hNw">
+        <di:waypoint x="349.0" y="210.0"/>
+        <di:waypoint x="460.0" y="210.0"/>
+        <di:waypoint x="460.0" y="332.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn2:definitions>
