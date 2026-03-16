@@ -115,9 +115,21 @@ export class BPMNManhattanRouter extends AbstractEdgeRouter {
         routedCorners.forEach(corner => result.push(corner));
         result.push({ kind: 'target', ...targetAnchor });
 
+        // Guard: filter out any points with NaN coordinates before handing the
+        // result to the framework renderer. NaN values in segments cause
+        // "Cannot determine direction of line" in createPathForSegments.
+        const sanitized = result.filter(p => !isNaN(p.x) && !isNaN(p.y));
+
+        // Guard: renderAdditionals requires at least source + target point.
+        // Return empty array if sanitizing removed too many points.
+        if (sanitized.length < 2) {
+            return [];
+        }
+
         this.debug(`route() edge=${edge.id} corners=${routedCorners.length} existingPoints=${edge.routingPoints.length}`);
-        this.debugPoints('  result', result);
-        return result;
+        this.debugPoints('  result', sanitized);
+
+        return sanitized;
     }
 
     /**
